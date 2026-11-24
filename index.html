@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f766e">
+<title>會議簽到</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+  :root { --main:#0f766e; --main-soft:#e6f4f2; --ink:#1f2937; --sub:#6b7280; --line:#e5e7eb; --warn:#b45309; --bad:#b91c1c; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,"PingFang TC","Noto Sans TC","Microsoft JhengHei",sans-serif; color:var(--ink); background:#f6f7f8; font-size:16px; }
+  header { background:var(--main); color:#fff; padding:14px 18px; font-weight:600; font-size:18px; display:flex; justify-content:space-between; align-items:center; }
+  header a { color:#fff; font-size:14px; font-weight:400; opacity:.9; cursor:pointer; }
+  main { max-width:760px; margin:0 auto; padding:16px; }
+  .card { background:#fff; border-radius:12px; padding:16px; margin-bottom:14px; box-shadow:0 1px 2px rgba(0,0,0,.05); }
+  h2 { font-size:17px; margin:0 0 12px; }
+  label { display:block; font-size:14px; color:var(--sub); margin:12px 0 4px; }
+  input, select { width:100%; padding:11px 12px; font-size:16px; border:1px solid var(--line); border-radius:8px; background:#fff; }
+  button { font-size:16px; padding:11px 16px; border-radius:8px; border:0; background:var(--main); color:#fff; cursor:pointer; }
+  button.ghost { background:var(--main-soft); color:var(--main); }
+  button.danger { background:#fdecec; color:var(--bad); }
+  button.small { font-size:14px; padding:7px 11px; }
+  button.block { width:100%; margin-top:16px; }
+  button:disabled { opacity:.5; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  .two { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .three { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; }
+  .muted { color:var(--sub); font-size:14px; }
+  .note { background:var(--main-soft); border-radius:8px; padding:10px 12px; font-size:14px; margin-top:12px; }
+  .item { padding:12px 0; border-top:1px solid var(--line); }
+  .item:first-child { border-top:0; padding-top:0; }
+  .tag { display:inline-block; font-size:12px; padding:2px 8px; border-radius:99px; background:var(--main-soft); color:var(--main); }
+  .tag.late { background:#fef3c7; color:var(--warn); }
+  .tag.gray { background:#f3f4f6; color:var(--sub); }
+  .center { text-align:center; }
+  .big-icon { font-size:64px; margin:8px 0; }
+  .err { color:var(--bad); font-size:14px; margin-top:10px; min-height:1em; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  th { color:var(--sub); font-weight:500; }
+  .tabs { display:flex; gap:8px; margin-bottom:14px; }
+  .tabs button { flex:1; }
+  #qrbox { display:flex; justify-content:center; padding:12px; background:#fff; }
+  .qr-screen h1 { font-size:28px; margin:8px 0 4px; }
+  .count { font-size:44px; font-weight:700; color:var(--main); }
+  .spinner { width:36px; height:36px; border:4px solid var(--main-soft); border-top-color:var(--main); border-radius:50%; animation:spin 1s linear infinite; margin:60px auto 12px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+<header><span id="appTitle">會議簽到</span><a id="headerLink"></a></header>
+<main id="app"><div class="spinner"></div><p class="center muted">載入中…</p></main>
+
+<script>
+// ===================== 設定（部署時請修改） =====================
+const CONFIG = {
+  API_URL: '請填入 Apps Script 網頁應用程式網址',
+  UNITS: ['放射技術組', '放射科醫師', '護理', '行政', '其他'],
+  APP_NAME: '會議簽到'
+};
+// ==============================================================
+
+const app = document.getElementById('app');
+const $ = id => document.getElementById(id);
+let me = null, qrTimer = null, pendingConfirm = null;
+
+// ---- 手機識別碼：存在這支手機的瀏覽器裡 ----
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+  del(k) { try { localStorage.removeItem(k); } catch (e) {} }
+};
+function deviceToken() {
+  let t = store.get('deviceToken');
+  if (!t) {
+    const b = new Uint8Array(24); crypto.getRandomValues(b);
+    t = Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+    store.set('deviceToken', t);
+  }
+  return t;
+}
+
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const view = html => { stopQr(); pendingConfirm = null; app.innerHTML = html; window.scrollTo(0, 0); };
+const loading = (msg = '處理中…') => view(`<div class="spinner"></div><p class="center muted">${esc(msg)}</p>`);
+const setHeader = (text, fn) => { const a = $('headerLink'); a.textContent = text || ''; a.onclick = fn || null; };
+
+async function api(action, data = {}) {
+  // 不設 Content-Type，避免 CORS 預檢（Apps Script 不支援）
+  const body = Object.assign({ action, deviceToken: deviceToken(), adminToken: store.get('adminToken') }, data);
+  let j;
+  try {
+    const res = await fetch(CONFIG.API_URL, { method: 'POST', body: JSON.stringify(body) });
+    j = await res.json();
+  } catch (e) { throw new Error('無法連線到伺服器，請檢查網路後再試'); }
+  if (!j.ok) {
+    if (j.code === 'ADMIN_AUTH') { store.del('adminToken'); renderAdminLogin(); }
+    const e = new Error(j.message); e.code = j.code; throw e;
+  }
+  return j.data;
+}
+
+function showError(msg) {
+  view(`<div class="card center"><div class="big-icon">⚠️</div><p>${esc(msg)}</p>
+    <button class="ghost" onclick="location.reload()">重新整理</button></div>`);
+}
+
+async function main() {
+  document.title = $('appTitle').textContent = CONFIG.APP_NAME;
+  const p = new URLSearchParams(location.search);
+  if (p.has('admin')) return store.get('adminToken') ? renderAdmin() : renderAdminLogin();
+  try {
+    me = (await api('me')).member;
+    if (p.get('m')) {
+      const meetingId = p.get('m'), token = p.get('t');
+      history.replaceState(null, '', location.pathname); // 避免重新整理時重送過期 QR
+      return me ? doCheckin(meetingId, token) : renderBind(() => doCheckin(meetingId, token));
+    }
+    me ? renderHome() : renderBind(renderHome);
+  } catch (e) { showError(e.message); }
+}
+
+// ---------------- 身分綁定 ----------------
+function renderBind(next) {
+  setHeader('');
+  view(`<div class="card">
+    <h2>綁定身分</h2>
+    <p class="muted">綁定後，這支手機掃 QR code 就能直接簽到。</p>
+    <label>員工編號</label><input id="fEmp" maxlength="20" autocomplete="off" placeholder="例如 012345">
+    <label>姓名</label><input id="fName" maxlength="20" placeholder="與人事資料相同">
+    <label>簽到密碼（4～6 位數字）</label><input id="fPin" type="password" inputmode="numeric" maxlength="6" autocomplete="off">
+    <div class="note">・<b>第一次使用</b>：請自訂一組密碼並記下來<br>・<b>換手機或資料被清除</b>：輸入原本的密碼即可<br>・忘記密碼請洽管理者重設</div>
+    <button class="block" id="bindBtn">確認</button>
+    <div class="err" id="err"></div></div>`);
+  $('bindBtn').onclick = async () => {
+    const btn = $('bindBtn'); btn.disabled = true; $('err').textContent = '';
+    try {
+      const r = await api('bind', { empId: $('fEmp').value, name: $('fName').value, pin: $('fPin').value });
+      me = r.member;
+      next();
+    } catch (e) { $('err').textContent = e.message; btn.disabled = false; }
+  };
+}
+
+// ---------------- 簽到 ----------------
+async function doCheckin(meetingId, token) {
+  loading('簽到中…');
+  try {
+    const r = await api('checkin', { meetingId, token });
+    const late = r.status === '遲到';
+    view(`<div class="card center">
+      <div class="big-icon">${r.already ? 'ℹ️' : (late ? '⏰' : '✅')}</div>
+      <h2>${r.already ? '您已經簽到過了' : (late ? '簽到完成（遲到）' : '簽到成功')}</h2>
+      <p><b>${esc(r.title)}</b>${r.location ? '<br><span class="muted">' + esc(r.location) + '</span>' : ''}</p>
+      <p class="muted">${esc(r.name)}　${esc(r.time)}　<span class="tag ${late ? 'late' : ''}">${esc(r.status)}</span></p>
+      <button class="block ghost" onclick="renderHome()">查看我的紀錄</button></div>`);
+  } catch (e) {
+    view(`<div class="card center"><div class="big-icon">❌</div><h2>簽到失敗</h2><p>${esc(e.message)}</p>
+      <button class="block ghost" onclick="renderHome()">回首頁</button></div>`);
+  }
+}
+
+// ---------------- 個人首頁 ----------------
+async function renderHome() {
+  if (!me) return renderBind(renderHome);
+  setHeader('');
+  loading();
+  try {
+    const d = await api('home');
+    view(`<div class="card">
+        <h2>您好，${esc(me.name)}</h2>
+        <p class="muted">${esc(me.unit)}・員編 ${esc(me.empId)}</p>
+      </div>
+      <div class="card"><h2>即將舉行的會議</h2>
+        ${d.upcoming.length ? d.upcoming.map(m => `<div class="item"><b>${esc(m.title)}</b><br>
+          <span class="muted">${esc(m.startText)}–${esc(m.endText)}${m.location ? '・' + esc(m.location) : ''}</span></div>`).join('')
+          : '<p class="muted">目前沒有排定的會議</p>'}
+      </div>
+      <div class="card"><h2>我的簽到紀錄</h2>
+        ${d.records.length ? d.records.map(r => `<div class="item">${esc(r.title)}<br>
+          <span class="muted">${esc(r.time)}</span> <span class="tag ${r.status === '遲到' ? 'late' : ''}">${esc(r.status)}</span></div>`).join('')
+          : '<p class="muted">尚無紀錄</p>'}
+        <p class="muted">簽到方式：開會時用<b>手機相機</b>掃描現場 QR code。</p>
+      </div>`);
+  } catch (e) {
+    if (e.code === 'NOT_BOUND') { me = null; return renderBind(renderHome); }
+    showError(e.message);
+  }
+}
+
+// ---------------- 管理者 ----------------
+function renderAdminLogin() {
+  setHeader('');
+  view(`<div class="card"><h2>管理者登入</h2>
+    <label>管理者密碼</label><input id="fCode" type="password">
+    <button class="block" id="loginBtn">登入</button><div class="err" id="err"></div></div>`);
+  $('loginBtn').onclick = async () => {
+    try {
+      const r = await api('adminLogin', { code: $('fCode').value });
+      store.set('adminToken', r.adminToken);
+      renderAdmin();
+    } catch (e) { $('err').textContent = e.message; }
+  };
+}
+
+function adminTabs(active) {
+  return `<div class="tabs">
+    <button class="${active === 'meetings' ? '' : 'ghost'}" onclick="renderAdmin()">會議</button>
+    <button class="${active === 'members' ? '' : 'ghost'}" onclick="renderMembers()">成員名單</button></div>`;
+}
+
+function logoutAdmin() { store.del('adminToken'); renderAdminLogin(); }
+
+function toLocalInput(d) {
+  const z = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}T${z(d.getHours())}:${z(d.getMinutes())}`;
+}
+
+// 按兩下才執行，避免誤觸（不用 confirm 對話框）
+function confirmTwice(btn, key, label, action) {
+  if (pendingConfirm !== key) { pendingConfirm = key; btn.textContent = label; return; }
+  pendingConfirm = null; btn.disabled = true; action();
+}
+
+async function renderAdmin() {
+  setHeader('登出', logoutAdmin);
+  loading();
+  let list;
+  try { list = await api('listMeetings'); } catch (e) { if (e.code !== 'ADMIN_AUTH') showError(e.message); return; }
+  const s = new Date(); s.setMinutes(0, 0, 0); s.setHours(s.getHours() + 1);
+  const e = new Date(s.getTime() + 60 * 60000);
+  const now = Date.now();
+  view(`${adminTabs('meetings')}
+    <div class="card"><h2>新增會議</h2>
+      <label>會議名稱</label><input id="mTitle" maxlength="60" placeholder="例如：11 月品管會議">
+      <div class="two">
+        <div><label>開始</label><input id="mStart" type="datetime-local" value="${toLocalInput(s)}"></div>
+        <div><label>結束</label><input id="mEnd" type="datetime-local" value="${toLocalInput(e)}"></div>
+      </div>
+      <label>地點</label><input id="mLoc" maxlength="40" placeholder="例如：放射科會議室">
+      <label>對象單位（用於統計未簽到名單）</label>
+      <select id="mTarget"><option value="">全部成員</option>${CONFIG.UNITS.map(u => `<option>${esc(u)}</option>`).join('')}</select>
+      <button class="block" id="createBtn">建立會議</button><div class="err" id="err"></div>
+    </div>
+    <div class="card"><h2>會議列表</h2>
+      ${list.length ? list.map(m => `<div class="item">
+        <b>${esc(m.title)}</b> ${m.end < now ? '<span class="tag gray">已結束</span>' : ''}<br>
+        <span class="muted">${esc(m.startText)}–${esc(m.endText)}${m.location ? '・' + esc(m.location) : ''}${m.target ? '・' + esc(m.target) : ''}・已簽到 ${m.count} 人</span>
+        <div class="row" style="margin-top:8px">
+          <button class="small" onclick="renderQr('${esc(m.id)}')">顯示 QR</button>
+          <button class="small ghost" onclick="renderAttendance('${esc(m.id)}')">出席名單</button>
+          <button class="small danger" onclick="confirmTwice(this,'del${esc(m.id)}','再按一次確認刪除',()=>deleteMeeting('${esc(m.id)}'))">刪除</button>
+        </div></div>`).join('') : '<p class="muted">還沒有會議</p>'}
+    </div>`);
+  $('createBtn').onclick = async () => {
+    const btn = $('createBtn'); btn.disabled = true;
+    try {
+      await api('createMeeting', {
+        title: $('mTitle').value, location: $('mLoc').value, target: $('mTarget').value,
+        start: new Date($('mStart').value).getTime(), end: new Date($('mEnd').value).getTime()
+      });
+      renderAdmin();
+    } catch (err) { $('err').textContent = err.message; btn.disabled = false; }
+  };
+}
+
+async function deleteMeeting(id) {
+  try { await api('deleteMeeting', { meetingId: id }); renderAdmin(); } catch (e) { alert(e.message); }
+}
+
+// ---- 成員名單 ----
+async function renderMembers() {
+  setHeader('登出', logoutAdmin);
+  loading();
+  let list;
+  try { list = await api('listMembers'); } catch (e) { if (e.code !== 'ADMIN_AUTH') showError(e.message); return; }
+  const bound = list.filter(m => m.bound).length;
+  view(`${adminTabs('members')}
+    <div class="card"><h2>新增成員</h2>
+      <div class="three">
+        <div><label>員工編號</label><input id="nEmp" maxlength="20"></div>
+        <div><label>姓名</label><input id="nName" maxlength="20"></div>
+        <div><label>單位</label><select id="nUnit">${CONFIG.UNITS.map(u => `<option>${esc(u)}</option>`).join('')}</select></div>
+      </div>
+      <button class="block" id="addBtn">新增</button><div class="err" id="err"></div>
+      <p class="muted">人數多時，可直接在 Google 試算表「成員」工作表貼上名單。</p>
+    </div>
+    <div class="card"><h2>成員（${list.length} 人，已綁定 ${bound} 人）</h2>
+      ${list.length ? `<table><tr><th>員編</th><th>姓名</th><th>單位</th><th>狀態</th><th></th></tr>
+      ${list.map(m => `<tr><td>${esc(m.empId)}</td><td>${esc(m.name)}</td><td>${esc(m.unit)}</td>
+        <td>${m.bound ? '<span class="tag">已綁定</span>' : '<span class="tag gray">未綁定</span>'}
+          ${m.rebindCount ? `<br><span class="muted">重綁 ${m.rebindCount} 次</span>` : ''}</td>
+        <td>${m.bound ? `<button class="small danger" onclick="confirmTwice(this,'rs${esc(m.empId)}','確認重設？',()=>resetMember('${esc(m.empId)}'))">重設</button>` : ''}</td></tr>`).join('')}
+      </table>
+      <p class="muted">「重設」會清除這位同仁的手機綁定與密碼，讓他重新設定。「重綁次數」偏高時，可能有代簽情形，值得留意。</p>`
+      : '<p class="muted">名單是空的，請先新增成員</p>'}
+    </div>`);
+  $('addBtn').onclick = async () => {
+    const btn = $('addBtn'); btn.disabled = true;
+    try {
+      await api('addMember', { empId: $('nEmp').value, name: $('nName').value, unit: $('nUnit').value });
+      renderMembers();
+    } catch (e) { $('err').textContent = e.message; btn.disabled = false; }
+  };
+}
+
+async function resetMember(empId) {
+  try { await api('resetMember', { empId }); renderMembers(); } catch (e) { alert(e.message); }
+}
+
+// ---- QR 投影畫面（每 60 秒換一次，防止拍照轉傳代簽） ----
+function stopQr() { if (qrTimer) { clearInterval(qrTimer); qrTimer = null; } }
+
+async function renderQr(id) {
+  setHeader('返回', renderAdmin);
+  view(`<div class="qr-screen card center">
+      <h1 id="qTitle">…</h1><p class="muted" id="qInfo"></p>
+      <div id="qrbox"></div>
+      <p class="muted">請用手機相機掃描簽到・QR code 每分鐘自動更新</p>
+      <div class="count" id="qCount">0</div><div class="muted">已簽到人數</div>
+      <p id="qRecent" class="muted"></p>
+      <button class="ghost small" onclick="document.documentElement.requestFullscreen && document.documentElement.requestFullscreen()">全螢幕</button>
+    </div>`);
+  const size = Math.max(220, Math.min(window.innerWidth - 80, window.innerHeight - 320, 420));
+  const qr = new QRCode($('qrbox'), { width: size, height: size, correctLevel: QRCode.CorrectLevel.M });
+  const base = location.origin + location.pathname;
+  let lastToken = null;
+  const tick = async () => {
+    try {
+      const d = await api('qrToken', { meetingId: id });
+      if (!$('qrbox')) return;
+      if (d.token !== lastToken) {
+        lastToken = d.token;
+        qr.makeCode(`${base}?m=${encodeURIComponent(id)}&t=${d.token}`);
+      }
+      $('qTitle').textContent = d.meeting.title;
+      $('qInfo').textContent = `${d.meeting.startText}–${d.meeting.endText}${d.meeting.location ? '・' + d.meeting.location : ''}`;
+      $('qCount').textContent = d.count;
+      $('qRecent').textContent = d.recent.length ? '最新簽到：' + d.recent.join('、') : '';
+    } catch (e) { if ($('qRecent')) $('qRecent').textContent = '連線異常，重試中…（' + e.message + '）'; }
+  };
+  await tick();
+  qrTimer = setInterval(tick, 10000);
+}
+
+// ---- 出席名單與匯出 ----
+async function renderAttendance(id) {
+  setHeader('返回', renderAdmin);
+  loading();
+  let d;
+  try { d = await api('attendance', { meetingId: id }); } catch (e) { if (e.code !== 'ADMIN_AUTH') showError(e.message); return; }
+  const late = d.present.filter(p => p.status === '遲到').length;
+  view(`<div class="card"><h2>${esc(d.meeting.title)}</h2>
+      <p class="muted">${esc(d.meeting.startText)}–${esc(d.meeting.endText)}${d.meeting.location ? '・' + esc(d.meeting.location) : ''}</p>
+      <p>出席 <b>${d.present.length}</b> 人（遲到 ${late}）・未簽到 <b>${d.absent.length}</b> 人</p>
+      <button class="small" onclick="exportCsv()">匯出 Excel（CSV）</button>
+      <p class="muted">完整紀錄也可直接在 Google 試算表「簽到紀錄」工作表查看。</p></div>
+    <div class="card"><h2>已簽到</h2>
+      ${d.present.length ? `<table><tr><th>姓名</th><th>單位</th><th>時間</th><th>狀態</th></tr>
+      ${d.present.map(p => `<tr><td>${esc(p.name)}</td><td>${esc(p.unit)}</td><td>${esc(p.time.slice(11))}</td><td><span class="tag ${p.status === '遲到' ? 'late' : ''}">${esc(p.status)}</span></td></tr>`).join('')}</table>`
+      : '<p class="muted">尚無人簽到</p>'}</div>
+    <div class="card"><h2>未簽到</h2>
+      ${d.absent.length ? `<table><tr><th>姓名</th><th>單位</th><th>員編</th></tr>
+      ${d.absent.map(p => `<tr><td>${esc(p.name)}</td><td>${esc(p.unit)}</td><td>${esc(p.empId)}</td></tr>`).join('')}</table>`
+      : '<p class="muted">全員到齊 🎉</p>'}</div>`);
+  window.exportCsv = () => {
+    const q = v => '"' + String(v).replace(/"/g, '""') + '"';
+    const empCell = v => '="' + String(v).replace(/"/g, '') + '"'; // 讓 Excel 保留員編開頭的 0
+    const lines = ['會議,姓名,員工編號,單位,簽到時間,狀態'];
+    d.present.forEach(p => lines.push([q(d.meeting.title), q(p.name), empCell(p.empId), q(p.unit), q(p.time), q(p.status)].join(',')));
+    d.absent.forEach(p => lines.push([q(d.meeting.title), q(p.name), empCell(p.empId), q(p.unit), '""', q('未簽到')].join(',')));
+    const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `${d.meeting.title}_出席名單.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+  };
+}
+
+main();
+</script>
+</body>
+</html>
