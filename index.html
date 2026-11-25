@@ -55,8 +55,8 @@
 <script>
 // ===================== 設定（部署時請修改） =====================
 const CONFIG = {
-  API_URL: 'https://script.google.com/macros/s/AKfycbxLmiO74vpYxUf-cel8Pjq7XpZ-peeqdth6LgUZbIkCJURN7OXdHPJcO6W3OcQ4iAHlnw/exec',
-  UNITS: ['放射師', '醫師', '護理師', '書記', '其他'],
+  API_URL: '請填入 Apps Script 網頁應用程式網址',
+  UNITS: ['放射技術組', '放射科醫師', '護理', '行政', '其他'],
   APP_NAME: '會議簽到'
 };
 // ==============================================================
@@ -129,17 +129,22 @@ function renderBind(next) {
     <p class="muted">綁定後，這支手機掃 QR code 就能直接簽到。</p>
     <label>員工編號</label><input id="fEmp" maxlength="20" autocomplete="off" placeholder="例如 012345">
     <label>姓名</label><input id="fName" maxlength="20" placeholder="與人事資料相同">
-    <label>簽到密碼（4～6 位數字）</label><input id="fPin" type="password" inputmode="numeric" maxlength="6" autocomplete="off">
-    <div class="note">・<b>第一次使用</b>：請自訂一組密碼並記下來<br>・<b>換手機或資料被清除</b>：輸入原本的密碼即可<br>・忘記密碼請洽管理者重設</div>
-    <button class="block" id="bindBtn">確認</button>
+    <div class="note">・每個員編只能綁定<b>一支手機</b>，綁定後其他裝置無法簽到<br>・請固定用<b>手機內建相機 App</b> 掃描（iPhone 請勿用控制中心的掃描器）<br>・換手機時，請洽管理者重設</div>
+    <button class="block" id="bindBtn">確認綁定</button>
     <div class="err" id="err"></div></div>`);
   $('bindBtn').onclick = async () => {
     const btn = $('bindBtn'); btn.disabled = true; $('err').textContent = '';
     try {
-      const r = await api('bind', { empId: $('fEmp').value, name: $('fName').value, pin: $('fPin').value });
+      const r = await api('bind', { empId: $('fEmp').value, name: $('fName').value });
       me = r.member;
       next();
-    } catch (e) { $('err').textContent = e.message; btn.disabled = false; }
+    } catch (e) {
+      if (e.code === 'DEVICE_MISMATCH') {
+        return view(`<div class="card center"><div class="big-icon">❌</div><h2>簽到失敗：裝置不符</h2>
+          <p style="white-space:pre-line">${esc(e.message)}</p></div>`);
+      }
+      $('err').textContent = e.message; btn.disabled = false;
+    }
   };
 }
 
@@ -226,8 +231,9 @@ function confirmTwice(btn, key, label, action) {
 async function renderAdmin() {
   setHeader('登出', logoutAdmin);
   loading();
-  let list;
-  try { list = await api('listMeetings'); } catch (e) { if (e.code !== 'ADMIN_AUTH') showError(e.message); return; }
+  let list, groups;
+  try { [list, groups] = await Promise.all([api('listMeetings'), api('groupList')]); }
+  catch (e) { if (e.code !== 'ADMIN_AUTH') showError(e.message); return; }
   const s = new Date(); s.setMinutes(0, 0, 0); s.setHours(s.getHours() + 1);
   const e = new Date(s.getTime() + 60 * 60000);
   const now = Date.now();
@@ -239,14 +245,18 @@ async function renderAdmin() {
         <div><label>結束</label><input id="mEnd" type="datetime-local" value="${toLocalInput(e)}"></div>
       </div>
       <label>地點</label><input id="mLoc" maxlength="40" placeholder="例如：放射科會議室">
-      <label>對象單位（用於統計未簽到名單）</label>
-      <select id="mTarget"><option value="">全部成員</option>${CONFIG.UNITS.map(u => `<option>${esc(u)}</option>`).join('')}</select>
+      <label>參與對象（決定這場會議的應到名單）</label>
+      <select id="mTarget"><option value="">全部成員</option>
+        ${groups.length ? `<optgroup label="群組">${groups.map(g => `<option value="群組:${esc(g)}">${esc(g)}</option>`).join('')}</optgroup>` : ''}
+        <optgroup label="單位">${CONFIG.UNITS.map(u => `<option value="${esc(u)}">${esc(u)}</option>`).join('')}</optgroup>
+      </select>
+      ${groups.length ? '' : '<p class="muted">想依會議種類設定不同名單？到「成員名單」幫成員加上群組即可。</p>'}
       <button class="block" id="createBtn">建立會議</button><div class="err" id="err"></div>
     </div>
     <div class="card"><h2>會議列表</h2>
       ${list.length ? list.map(m => `<div class="item">
         <b>${esc(m.title)}</b> ${m.end < now ? '<span class="tag gray">已結束</span>' : ''}<br>
-        <span class="muted">${esc(m.startText)}–${esc(m.endText)}${m.location ? '・' + esc(m.location) : ''}${m.target ? '・' + esc(m.target) : ''}・已簽到 ${m.count} 人</span>
+        <span class="muted">${esc(m.startText)}–${esc(m.endText)}${m.location ? '・' + esc(m.location) : ''}・對象：${esc(m.targetText)}・已簽到 ${m.count} 人</span>
         <div class="row" style="margin-top:8px">
           <button class="small" onclick="renderQr('${esc(m.id)}')">顯示 QR</button>
           <button class="small ghost" onclick="renderAttendance('${esc(m.id)}')">出席名單</button>
@@ -275,6 +285,7 @@ async function renderMembers() {
   loading();
   let list;
   try { list = await api('listMembers'); } catch (e) { if (e.code !== 'ADMIN_AUTH') showError(e.message); return; }
+  membersCache = list;
   const bound = list.filter(m => m.bound).length;
   view(`${adminTabs('members')}
     <div class="card"><h2>新增成員</h2>
@@ -283,26 +294,42 @@ async function renderMembers() {
         <div><label>姓名</label><input id="nName" maxlength="20"></div>
         <div><label>單位</label><select id="nUnit">${CONFIG.UNITS.map(u => `<option>${esc(u)}</option>`).join('')}</select></div>
       </div>
+      <label>群組（可不填；多個請用逗號分隔，例如：品管小組,HFMEA小組）</label><input id="nGroups" maxlength="200">
       <button class="block" id="addBtn">新增</button><div class="err" id="err"></div>
       <p class="muted">人數多時，可直接在 Google 試算表「成員」工作表貼上名單。</p>
     </div>
     <div class="card"><h2>成員（${list.length} 人，已綁定 ${bound} 人）</h2>
-      ${list.length ? `<table><tr><th>員編</th><th>姓名</th><th>單位</th><th>狀態</th><th></th></tr>
+      ${list.length ? `<table><tr><th>員編</th><th>姓名</th><th>單位</th><th>群組</th><th>狀態</th><th></th></tr>
       ${list.map(m => `<tr><td>${esc(m.empId)}</td><td>${esc(m.name)}</td><td>${esc(m.unit)}</td>
+        <td><span id="g_${esc(m.empId)}">${esc(m.groups) || '<span class="muted">—</span>'}</span>
+          <br><button class="small ghost" onclick="editGroups('${esc(m.empId)}')">編輯</button></td>
         <td>${m.bound ? '<span class="tag">已綁定</span>' : '<span class="tag gray">未綁定</span>'}
-          ${m.rebindCount ? `<br><span class="muted">重綁 ${m.rebindCount} 次</span>` : ''}</td>
+          ${m.rebindCount ? `<br><span class="muted">重設 ${m.rebindCount} 次</span>` : ''}</td>
         <td>${m.bound ? `<button class="small danger" onclick="confirmTwice(this,'rs${esc(m.empId)}','確認重設？',()=>resetMember('${esc(m.empId)}'))">重設</button>` : ''}</td></tr>`).join('')}
       </table>
-      <p class="muted">「重設」會清除這位同仁的手機綁定與密碼，讓他重新設定。「重綁次數」偏高時，可能有代簽情形，值得留意。</p>`
+      <p class="muted">同仁換手機時，按「重設」清除舊手機的綁定，請他用新手機掃描 QR code 重新綁定。「重設次數」偏高時，可能有代簽情形，值得留意。</p>`
       : '<p class="muted">名單是空的，請先新增成員</p>'}
     </div>`);
   $('addBtn').onclick = async () => {
     const btn = $('addBtn'); btn.disabled = true;
     try {
-      await api('addMember', { empId: $('nEmp').value, name: $('nName').value, unit: $('nUnit').value });
+      await api('addMember', { empId: $('nEmp').value, name: $('nName').value, unit: $('nUnit').value, groups: $('nGroups').value });
       renderMembers();
     } catch (e) { $('err').textContent = e.message; btn.disabled = false; }
   };
+}
+
+let membersCache = [];
+function editGroups(empId) {
+  const m = membersCache.find(x => x.empId === empId);
+  const cell = $('g_' + empId);
+  cell.innerHTML = `<input id="gi_${esc(empId)}" value="${esc(m ? m.groups.replace(/、/g, ',') : '')}" placeholder="品管小組,HFMEA小組" style="min-width:140px">
+    <button class="small" onclick="saveGroups('${esc(empId)}')">儲存</button>`;
+  cell.nextElementSibling && cell.nextElementSibling.remove(); // 隱藏「編輯」按鈕旁的換行
+  const btn = cell.parentElement.querySelector('button.ghost'); if (btn) btn.remove();
+}
+async function saveGroups(empId) {
+  try { await api('setGroups', { empId, groups: $('gi_' + empId).value }); renderMembers(); } catch (e) { alert(e.message); }
 }
 
 async function resetMember(empId) {
@@ -317,7 +344,7 @@ async function renderQr(id) {
   view(`<div class="qr-screen card center">
       <h1 id="qTitle">…</h1><p class="muted" id="qInfo"></p>
       <div id="qrbox"></div>
-      <p class="muted">請用手機相機掃描簽到・QR code 每分鐘自動更新</p>
+      <p class="muted">請用<b>手機內建相機 App</b> 掃描簽到（iPhone 請勿用控制中心的掃描器）・QR code 每分鐘自動更新</p>
       <div class="count" id="qCount">0</div><div class="muted">已簽到人數</div>
       <p id="qRecent" class="muted"></p>
       <button class="ghost small" onclick="document.documentElement.requestFullscreen && document.documentElement.requestFullscreen()">全螢幕</button>
@@ -352,13 +379,13 @@ async function renderAttendance(id) {
   try { d = await api('attendance', { meetingId: id }); } catch (e) { if (e.code !== 'ADMIN_AUTH') showError(e.message); return; }
   const late = d.present.filter(p => p.status === '遲到').length;
   view(`<div class="card"><h2>${esc(d.meeting.title)}</h2>
-      <p class="muted">${esc(d.meeting.startText)}–${esc(d.meeting.endText)}${d.meeting.location ? '・' + esc(d.meeting.location) : ''}</p>
+      <p class="muted">${esc(d.meeting.startText)}–${esc(d.meeting.endText)}${d.meeting.location ? '・' + esc(d.meeting.location) : ''}・對象：${esc(d.meeting.targetText)}</p>
       <p>出席 <b>${d.present.length}</b> 人（遲到 ${late}）・未簽到 <b>${d.absent.length}</b> 人</p>
       <button class="small" onclick="exportCsv()">匯出 Excel（CSV）</button>
       <p class="muted">完整紀錄也可直接在 Google 試算表「簽到紀錄」工作表查看。</p></div>
     <div class="card"><h2>已簽到</h2>
       ${d.present.length ? `<table><tr><th>姓名</th><th>單位</th><th>時間</th><th>狀態</th></tr>
-      ${d.present.map(p => `<tr><td>${esc(p.name)}</td><td>${esc(p.unit)}</td><td>${esc(p.time.slice(11))}</td><td><span class="tag ${p.status === '遲到' ? 'late' : ''}">${esc(p.status)}</span></td></tr>`).join('')}</table>`
+      ${d.present.map(p => `<tr><td>${esc(p.name)}</td><td>${esc(p.unit)}</td><td>${esc(p.time.slice(11))}</td><td><span class="tag ${p.status === '遲到' ? 'late' : ''}">${esc(p.status)}</span>${p.outside ? ' <span class="tag gray">名單外</span>' : ''}</td></tr>`).join('')}</table>`
       : '<p class="muted">尚無人簽到</p>'}</div>
     <div class="card"><h2>未簽到</h2>
       ${d.absent.length ? `<table><tr><th>姓名</th><th>單位</th><th>員編</th></tr>
@@ -368,7 +395,7 @@ async function renderAttendance(id) {
     const q = v => '"' + String(v).replace(/"/g, '""') + '"';
     const empCell = v => '="' + String(v).replace(/"/g, '') + '"'; // 讓 Excel 保留員編開頭的 0
     const lines = ['會議,姓名,員工編號,單位,簽到時間,狀態'];
-    d.present.forEach(p => lines.push([q(d.meeting.title), q(p.name), empCell(p.empId), q(p.unit), q(p.time), q(p.status)].join(',')));
+    d.present.forEach(p => lines.push([q(d.meeting.title), q(p.name), empCell(p.empId), q(p.unit), q(p.time), q(p.status + (p.outside ? '（名單外）' : ''))].join(',')));
     d.absent.forEach(p => lines.push([q(d.meeting.title), q(p.name), empCell(p.empId), q(p.unit), '""', q('未簽到')].join(',')));
     const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
     const a = document.createElement('a');
